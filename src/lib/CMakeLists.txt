@@ -32,6 +32,9 @@ set(editorconfig_LIBSRCS
     misc.c
     )
 
+set_source_files_properties(ec_glob.c PROPERTIES COMPILE_FLAGS "-x c++ -std=c++11")
+set_source_files_properties(ini.c PROPERTIES COMPILE_FLAGS "-x c++ -std=c++11")
+
 add_library(editorconfig_shared SHARED ${editorconfig_LIBSRCS})
 target_include_directories(editorconfig_shared
     INTERFACE $<INSTALL_INTERFACE:include>
@@ -45,7 +48,7 @@ set_target_properties(editorconfig_shared PROPERTIES
 if(WIN32)
     target_link_libraries(editorconfig_shared Shlwapi)
 endif()
-target_link_libraries(editorconfig_shared ${PCRE2_LIBRARIES})
+target_link_libraries(editorconfig_shared ${PCRE2_LIBRARIES} -lstdc++)
 if (BUILD_STATICALLY_LINKED_EXE)
     # disable shared library build when static is enabled
     set_target_properties(editorconfig_shared PROPERTIES

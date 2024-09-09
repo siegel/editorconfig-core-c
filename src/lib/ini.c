@@ -32,11 +32,17 @@ http://code.google.com/p/inih/
 
 */
 
+#include <dispatch/dispatch.h>
+#include <map>
+
 #include "global.h"
 
-#include <stdio.h>
+#include <sys/fcntl.h>
+#include <sys/stat.h>
+
 #include <ctype.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "ini.h"
 
@@ -97,13 +103,12 @@ static char* strncpy0(char* dest, const char* src, size_t size)
 
 /* See documentation in header file. */
 EDITORCONFIG_LOCAL
-int ini_parse_file(FILE* file,
+int ini_parse_file(const char *file /* null terminated */,
                    int (*handler)(void*, const char*, const char*,
                                   const char*),
                    void* user)
 {
     /* Uses a fair bit of stack (use heap instead if you need to) */
-    char line[MAX_LINE];
     char section[MAX_SECTION+1] = "";
     char prev_name[MAX_NAME+1] = "";
 
@@ -114,8 +119,28 @@ int ini_parse_file(FILE* file,
     int lineno = 0;
     int error = 0;
 
+    const char  *p = file;
+    
     /* Scan through file line by line */
-    while (fgets(line, sizeof(line), file) != NULL) {
+    while (0 != *p)
+    {
+        const char *nextLine = strchr(p, '\n');
+        char line[MAX_LINE];
+        
+        //  REVIEW copying each line is inefficient, but means the input is const
+        //  and can be kept in a cache.
+        if (nextLine == p) {
+        	line[0] = 0;	//	empty line, but passing a zero field with to snprintf would copy the whole buffer
+		}
+		else
+        if (NULL != nextLine) {
+            snprintf(line, sizeof(line), "%.*s", (int)(nextLine - p), p);
+        }
+        else {
+            //  we're at the end of the text, we'll exit after this line
+            snprintf(line, sizeof(line), "%s", p);  //  input is zero-terminated
+        }
+        
         lineno++;
 
         start = line;
@@ -185,9 +210,157 @@ int ini_parse_file(FILE* file,
                 error = lineno;
             }
         }
+        
+        if (NULL == nextLine)
+            break;
+        
+        p = nextLine + 1;
     }
 
     return error;
+}
+
+typedef struct CacheEntry
+{
+    char                *filename = NULL;
+    char                *data = NULL;
+    dispatch_source_t   dispatchSource = NULL;
+    int                 fd = 0;
+    
+    ~CacheEntry();
+} CacheEntry;
+
+CacheEntry::~CacheEntry()
+{
+    free(filename);
+    free(data);
+    dispatch_source_cancel(dispatchSource);
+    dispatch_release(dispatchSource);
+
+    if (0 != fd)
+        close(fd);
+}
+
+typedef std::map<std::string, CacheEntry*>  FileDataCache;
+
+ini_parse_cache_invalidation_callback   ini_parse_cache_invalidated;
+
+static
+char* ini_data_from_file(const char *filename)
+{
+    int file;
+    int error;
+    struct stat	status;
+    char    *data = NULL;
+    ssize_t actLen = 0;
+    
+    file = open(filename, O_RDONLY);
+    if (file < 0)
+        return NULL;  //  errno is set
+    
+    if (fstat(file, &status) < 0)
+    {
+        close(file);
+        return NULL;  //  errno is set
+    }
+    
+    data = static_cast<char*>(malloc(status.st_size + 1 /* room for trailing NULL */));
+    if (NULL == data)
+    {
+        close(file);
+        return NULL;
+    }
+    
+    actLen = read(file, data, status.st_size);
+    if (actLen < 0)
+    {
+        close(file);
+        free(data);
+        
+        return NULL;
+    }
+    
+    data[actLen] = 0;   //  null terminate
+    
+    close(file);
+    return data;
+}
+
+static
+char* ini_data_for_file(const char *filename, const char *data /* NULL to fetch, otherwise to store */)
+{
+    static dispatch_once_t  _inited;
+    static FileDataCache    *_map;
+    static pthread_mutex_t  _mutex;
+    
+    dispatch_once(&_inited,
+        ^()
+        {
+            pthread_mutexattr_t	mutexAttrs;
+            
+            pthread_mutexattr_init(&mutexAttrs);
+            pthread_mutexattr_settype(&mutexAttrs, PTHREAD_MUTEX_RECURSIVE);
+            
+            pthread_mutex_init(&_mutex, &mutexAttrs);
+            
+            pthread_mutexattr_destroy(&mutexAttrs);
+
+            _map = new FileDataCache;
+        }
+    );
+    
+    if (0 == pthread_mutex_lock(&_mutex))
+    {
+        if (NULL == data)
+        {
+            CacheEntry  *entry = (*_map)[filename];
+            
+            pthread_mutex_unlock(&_mutex);
+            
+            if (NULL != entry)
+                return entry->data;
+        }
+        else
+        {
+            CacheEntry  *entry = new CacheEntry;
+            
+            entry->filename = strdup(filename);
+            entry->data = const_cast<char*>(data);
+            entry->fd = open(filename, O_EVTONLY);
+            entry->dispatchSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE,
+                                                            entry->fd,
+                                                            (DISPATCH_VNODE_DELETE | DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_LINK | DISPATCH_VNODE_REVOKE),
+                                                            DISPATCH_TARGET_QUEUE_DEFAULT);
+            
+            dispatch_source_set_event_handler(entry->dispatchSource,
+                ^()
+                {
+                    //  we're here asynchronously on a different thread, so we need to acquire the lock.
+                    if (0 == pthread_mutex_lock(&_mutex))
+                    {
+                        //  punch it out of the cache, we'll reread it the next time we need it
+                        (*_map)[entry->filename] = NULL;
+                        
+                        if (NULL != ini_parse_cache_invalidated)
+                            ini_parse_cache_invalidated(entry->filename);
+                            
+                        delete entry;   //  this does all the cleanup
+                        
+                        pthread_mutex_unlock(&_mutex);
+                    }
+                }
+            );
+            
+            //  cache it, then start the dispatch source
+
+            (*_map)[filename] = entry;
+            dispatch_resume(entry->dispatchSource);
+            
+            pthread_mutex_unlock(&_mutex);
+        }
+    }
+    
+    return NULL;
 }
 
 /* See documentation in header file. */
@@ -196,13 +369,27 @@ int ini_parse(const char* filename,
               int (*handler)(void*, const char*, const char*, const char*),
               void* user)
 {
-    FILE* file;
-    int error;
-
-    file = fopen(filename, "r");
-    if (!file)
-        return -1;
-    error = ini_parse_file(file, handler, user);
-    fclose(file);
-    return error;
+    char    *data = NULL;
+    bool    wasCached = false;
+   
+    data = ini_data_for_file(filename, NULL);
+    if (NULL == data)
+        data = ini_data_from_file(filename);
+    else
+        wasCached = true;
+    
+    if (NULL != data)
+    {
+        int error = 0;
+        
+        if (0 == (error = ini_parse_file(data, handler, user)))
+        {
+            if (! wasCached)
+                ini_data_for_file(filename, data);  //  cache it
+        }
+        
+        return error;
+    }
+    
+    return -1;
 }

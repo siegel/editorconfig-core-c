@@ -42,8 +42,6 @@ http://code.google.com/p/inih/
 extern "C" {
 #endif
 
-#include <stdio.h>
-
 /* Parse given INI-style file. May have [section]s, name=value pairs
    (whitespace stripped), and comments starting with ';' (semicolon). Section
    is "" if name=value pair parsed before any section heading. name:value
@@ -65,7 +63,7 @@ int ini_parse(const char* filename,
 /* Same as ini_parse(), but takes a FILE* instead of filename. This doesn't
    close the file when it's finished -- the caller must do that. */
 EDITORCONFIG_LOCAL
-int ini_parse_file(FILE* file,
+int ini_parse_file(const char *file /* null terminated */,
                    int (*handler)(void* user, const char* section,
                                   const char* name, const char* value),
                    void* user);
@@ -78,7 +76,7 @@ int ini_parse_file(FILE* file,
 #endif
 
 #define MAX_SECTION_NAME 4096
-#define MAX_PROPERTY_NAME 50
+#define MAX_PROPERTY_NAME 128
 #define MAX_PROPERTY_VALUE 255
 
 /* Nonzero to allow a UTF-8 BOM sequence (0xEF 0xBB 0xBF) at the start of
@@ -86,6 +84,11 @@ int ini_parse_file(FILE* file,
 #ifndef INI_ALLOW_BOM
 #define INI_ALLOW_BOM 1
 #endif
+
+//  for cache-invalidation notification
+typedef void    (^ini_parse_cache_invalidation_callback)(const char *filename);
+
+extern  ini_parse_cache_invalidation_callback   ini_parse_cache_invalidated;
 
 #ifdef __cplusplus
 }
