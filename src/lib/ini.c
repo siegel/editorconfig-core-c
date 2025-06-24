@@ -198,8 +198,10 @@ int ini_parse_file(const char *file /* null terminated */,
                 /* Either name or value is too long. Skip it. */
                 if (strlen(name) > MAX_PROPERTY_NAME ||
                     strlen(value) > MAX_PROPERTY_VALUE)
-                    continue;
-
+                {
+                    goto NEXT_LINE;
+				}
+                
                 /* Valid name[=:]value pair found, call handler */
                 strncpy0(prev_name, name, sizeof(prev_name));
                 if (!handler(user, section, name, value) && !error)
@@ -210,7 +212,8 @@ int ini_parse_file(const char *file /* null terminated */,
                 error = lineno;
             }
         }
-        
+
+NEXT_LINE:
         if (NULL == nextLine)
             break;
         
